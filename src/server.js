@@ -10,6 +10,11 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // --- Middleware ---
+// Render (and most cloud hosts) sit behind a reverse proxy — this tells
+// Express to trust the X-Forwarded-For header so express-rate-limit can
+// correctly identify each client. (Harmless locally too.)
+app.set('trust proxy', 1);
+
 app.use(cors()); // In production, restrict this to your app's known origins.
 app.use(express.json({ limit: '15mb' })); // STAGE 6: images need more room than 1mb
 app.use(morgan('dev')); // request logging — never logs API keys or full message bodies.
