@@ -16,7 +16,7 @@ const PORT = process.env.PORT || 3000;
 app.set('trust proxy', 1);
 
 app.use(cors()); // In production, restrict this to your app's known origins.
-app.use(express.json({ limit: '15mb' })); // STAGE 6: images need more room than 1mb
+app.use(express.json({ limit: '30mb' })); // STAGE 6: images need more room than 1mb
 app.use(morgan('dev')); // request logging — never logs API keys or full message bodies.
 
 // Basic abuse protection (spec §18/§22). Tune these numbers for production.
