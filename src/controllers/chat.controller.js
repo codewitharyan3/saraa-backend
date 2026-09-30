@@ -1,10 +1,10 @@
 const SYSTEM_PROMPT = require('../services/systemPrompt');
+const { uploadVideoAndWaitUntilReady } = require('../services/geminiFiles');
 
 const GEMINI_API_BASE = 'https://generativelanguage.googleapis.com/v1beta/models';
 
 /**
- * A turn is valid if it has real text content, OR an attached image, or both.
- * (STAGE 6: image-only messages, e.g. just a photo with no caption, are allowed.)
+ * A turn is valid if it has real text, an image, or a video (or any mix).
  */
 function isValidHistory(messages) {
   return (
@@ -14,17 +14,14 @@ function isValidHistory(messages) {
       if (!m || (m.role !== 'user' && m.role !== 'assistant')) return false;
       const hasText = typeof m.content === 'string' && m.content.trim().length > 0;
       const hasImage = typeof m.imageBase64 === 'string' && m.imageBase64.length > 0;
-      return hasText || hasImage;
+      const hasVideo = typeof m.videoBase64 === 'string' && m.videoBase64.length > 0;
+      return hasText || hasImage || hasVideo;
     })
   );
 }
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-/**
- * Calls the Gemini API, automatically retrying a couple of times if Google's
- * servers report themselves as temporarily overloaded (503 UNAVAILABLE).
- */
 async function callGeminiWithRetry(url, apiKey, payload, maxAttempts = 3) {
   let lastResult = null;
 
@@ -63,10 +60,11 @@ async function callGeminiWithRetry(url, apiKey, payload, maxAttempts = 3) {
 }
 
 /**
- * Builds the Gemini "parts" array for one conversation turn: a text part
- * (if there's real text) and/or an inline_data image part (STAGE 6).
+ * Builds the Gemini "parts" array for one conversation turn: text, an
+ * inline image, and/or a video referenced via file_uri (STAGE 8 — videos
+ * are uploaded separately through the File API, not sent inline).
  */
-function buildParts(turn) {
+function buildParts(turn, uploadedVideo) {
   const parts = [];
   if (typeof turn.content === 'string' && turn.content.trim().length > 0) {
     parts.push({ text: turn.content });
@@ -79,13 +77,22 @@ function buildParts(turn) {
       }
     });
   }
+  if (uploadedVideo) {
+    parts.push({
+      file_data: {
+        mime_type: uploadedVideo.mimeType,
+        file_uri: uploadedVideo.fileUri
+      }
+    });
+  }
   return parts;
 }
 
 /**
- * STAGE 6: now also accepts an image attached to the latest user turn
- * (Gemini is multimodal, so this needs no separate vision model or endpoint).
- * Expects: { messages: [{ role, content, imageBase64?, imageMimeType? }, ...] }
+ * STAGE 8: also accepts a video attached to the latest user turn. The video
+ * is uploaded to Gemini's File API first (see services/geminiFiles.js),
+ * then referenced by URI in the actual chat request.
+ * Expects: { messages: [{ role, content, imageBase64?, imageMimeType?, videoBase64?, videoMimeType? }, ...] }
  */
 exports.sendMessage = async (req, res) => {
   const history = req.body?.messages;
@@ -93,7 +100,7 @@ exports.sendMessage = async (req, res) => {
   if (!isValidHistory(history)) {
     return res.status(400).json({
       success: false,
-      error: { message: 'A non-empty "messages" array with role/content (or an image) is required.' }
+      error: { message: 'A non-empty "messages" array with role/content (or media) is required.' }
     });
   }
 
@@ -105,12 +112,31 @@ exports.sendMessage = async (req, res) => {
     });
   }
 
+  // If the latest turn has a video, upload it to the File API first.
+  const lastTurn = history[history.length - 1];
+  let uploadedVideo = null;
+  if (lastTurn && typeof lastTurn.videoBase64 === 'string' && lastTurn.videoBase64.length > 0) {
+    try {
+      uploadedVideo = await uploadVideoAndWaitUntilReady(
+        lastTurn.videoBase64,
+        lastTurn.videoMimeType || 'video/mp4',
+        apiKey
+      );
+    } catch (err) {
+      console.error('Video upload error:', err.message);
+      return res.status(502).json({
+        success: false,
+        error: { message: `Couldn't process that video: ${err.message}` }
+      });
+    }
+  }
+
   const model = process.env.AI_MODEL || 'gemini-flash-lite-latest';
   const url = `${GEMINI_API_BASE}/${model}:generateContent`;
 
-  const contents = history.map((m) => ({
+  const contents = history.map((m, index) => ({
     role: m.role === 'assistant' ? 'model' : 'user',
-    parts: buildParts(m)
+    parts: buildParts(m, index === history.length - 1 ? uploadedVideo : null)
   }));
 
   try {
