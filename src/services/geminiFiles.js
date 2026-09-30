@@ -1,56 +1,68 @@
-const FormData = require('form-data');
-
 const FILES_UPLOAD_URL = 'https://generativelanguage.googleapis.com/upload/v1beta/files';
 const FILES_GET_BASE = 'https://generativelanguage.googleapis.com/v1beta';
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
- * Uploads a video (or any large file) to Google's Gemini File API and waits
- * until it finishes processing, then returns its file_uri for use in a
- * generateContent request.
+ * Uploads a video (or any large file) to Google's Gemini File API using
+ * their two-step "resumable upload" protocol, then waits until it finishes
+ * processing, and returns its file_uri for use in a generateContent request.
  *
- * Why this exists: unlike small images, videos are usually too big to send
- * inline in a single JSON request — Google's own File API is the supported
- * way to hand Gemini a video. This costs nothing extra beyond the normal
- * free-tier request quota.
+ * Step 1: tell Google "I'm about to upload N bytes of type X" -> get back a
+ *         one-time upload URL.
+ * Step 2: PUT/POST the actual bytes to that URL -> get back the file info.
  */
 async function uploadVideoAndWaitUntilReady(base64Data, mimeType, apiKey) {
   const buffer = Buffer.from(base64Data, 'base64');
+  const numBytes = buffer.length;
+  const mime = mimeType || 'video/mp4';
 
-  const form = new FormData();
-  form.append('metadata', JSON.stringify({ file: { displayName: 'saraa-upload' } }), {
-    contentType: 'application/json'
-  });
-  form.append('file', buffer, {
-    filename: 'upload',
-    contentType: mimeType || 'video/mp4'
-  });
-
-  const uploadResponse = await fetch(`${FILES_UPLOAD_URL}?uploadType=multipart`, {
+  // --- Step 1: start the resumable upload session ---
+  const startResponse = await fetch(`${FILES_UPLOAD_URL}?key=${apiKey}`, {
     method: 'POST',
     headers: {
-      'x-goog-api-key': apiKey,
-      ...form.getHeaders()
+      'X-Goog-Upload-Protocol': 'resumable',
+      'X-Goog-Upload-Command': 'start',
+      'X-Goog-Upload-Header-Content-Length': String(numBytes),
+      'X-Goog-Upload-Header-Content-Type': mime,
+      'Content-Type': 'application/json'
     },
-    body: form
+    body: JSON.stringify({ file: { display_name: 'saraa-upload' } })
+  });
+
+  if (!startResponse.ok) {
+    const text = await startResponse.text();
+    throw new Error(`Starting the video upload failed: ${text.slice(0, 200)}`);
+  }
+
+  const uploadUrl = startResponse.headers.get('x-goog-upload-url');
+  if (!uploadUrl) {
+    throw new Error('Video upload could not start (no upload URL returned by Google).');
+  }
+
+  // --- Step 2: upload the actual video bytes to that URL ---
+  const uploadResponse = await fetch(uploadUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Length': String(numBytes),
+      'X-Goog-Upload-Offset': '0',
+      'X-Goog-Upload-Command': 'upload, finalize'
+    },
+    body: buffer
   });
 
   const uploadData = await uploadResponse.json();
   if (!uploadResponse.ok) {
-    const message = uploadData?.error?.message || 'Video upload to the AI provider failed.';
-    throw new Error(message);
+    throw new Error(uploadData?.error?.message || 'Uploading the video bytes failed.');
   }
 
   let file = uploadData.file;
 
-  // Video needs a moment to finish processing on Google's side before it can be used.
+  // --- Step 3: wait for Google to finish processing the video ---
   const maxAttempts = 15;
   for (let attempt = 0; attempt < maxAttempts && file.state === 'PROCESSING'; attempt++) {
     await sleep(2000);
-    const statusResponse = await fetch(`${FILES_GET_BASE}/${file.name}`, {
-      headers: { 'x-goog-api-key': apiKey }
-    });
+    const statusResponse = await fetch(`${FILES_GET_BASE}/${file.name}?key=${apiKey}`);
     const statusData = await statusResponse.json();
     if (!statusResponse.ok) {
       throw new Error(statusData?.error?.message || 'Checking video processing status failed.');
@@ -62,7 +74,7 @@ async function uploadVideoAndWaitUntilReady(base64Data, mimeType, apiKey) {
     throw new Error('The video took too long to process. Please try a shorter clip.');
   }
 
-  return { fileUri: file.uri, mimeType: file.mimeType || mimeType };
+  return { fileUri: file.uri, mimeType: file.mimeType || mime };
 }
 
 module.exports = { uploadVideoAndWaitUntilReady };
