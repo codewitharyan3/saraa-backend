@@ -1,4 +1,5 @@
 require('dotenv').config();
+const path = require('path');
 const express = require('express');
 const cors = require('cors');
 const morgan = require('morgan');
@@ -35,6 +36,13 @@ app.get('/api/health', (req, res) => {
 });
 
 app.use('/api/chat', chatRoutes);
+
+// --- Web version of SARAA ---
+// Anyone can open this backend's URL directly in a browser (Chrome, Edge,
+// etc.) and get the full chat UI — no install needed. This serves the SAME
+// index.html/style.css/renderer.js files used by the desktop (Electron) app,
+// so the web and desktop experience are always identical by construction.
+app.use(express.static(path.join(__dirname, '..', 'public')));
 
 // --- 404 handler ---
 app.use((req, res) => {
